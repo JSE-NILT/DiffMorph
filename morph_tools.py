@@ -5,6 +5,9 @@ import numpy as np
 from morphing import Morph
 import cv2
 from nilt_base.NILTlogger import get_logger
+from scipy.ndimage import gaussian_filter
+
+from skimage import measure
 
 logger = get_logger("NILTlogger.morph_tool")
 
@@ -58,6 +61,10 @@ def load_image(file):
     np.ndarray
 
     """
+    if not os.path.exists(file):
+        raise FileNotFoundError(f"No such file: {file}")
+    if not os.path.isfile(file):
+        raise FileNotFoundError(f"{file} is not a file")
     im = cv2.imread(file, cv2.IMREAD_COLOR)
     return cv2.cvtColor(im, cv2.COLOR_BGR2RGB)
 
@@ -78,22 +85,65 @@ def save_image(path, array, detect_range=True):
     -------
 
     """
+    if not os.path.isdir(os.path.dirname(path)):
+        raise FileNotFoundError(f"Directory {os.path.dirname(path)} does not exist.")
+
     if detect_range:
         if np.max(array) <= 1.0:
-            array *= 255
+            logger.debug(f"Fixing range before saving {path}")
+            array = array * 255
 
     array = make_image_rgb(array)
     succes = cv2.imwrite(path, cv2.cvtColor(array.astype(np.uint8), cv2.COLOR_RGB2BGR))
     if not succes:
         raise RuntimeError("Image not saved sucessfully")
     else:
-        logging.debug(f"Successfully saved image to {path}")
+        logger.debug(f"Successfully saved image to {path}")
 
 
 def interpolate_pct(wanted, source, target):
     if source > target:
         raise ValueError("Source should be smaller than target value")
     return (wanted - source) / (target - source)
+
+
+def bbox_midpoint(min_row, min_col, max_row, max_col):
+    """ Get the midpoint of a bounding box
+
+    Parameters
+    ----------
+    min_row : int
+    min_col : int
+    max_row : int
+    max_col : int
+
+    Returns
+    -------
+    tuple
+        Midpoint af the bounding box, tuple of (middle row, middle col) as floats
+
+    """
+    return (min_row + max_row) / 2, (min_col + max_col) / 2
+
+
+def find_blobs(image):
+    """ Find individual structures in an im
+    
+    Parameters
+    ----------
+    image : cv2 image
+
+    Returns
+    -------
+    skimage.measure.regionprops
+    """
+    if np.ndim(image) == 3:
+        image = np.mean(image, axis=2)
+    binary = image > 127.5
+    blob_labels = measure.label(binary)
+    blob_features = measure.regionprops(blob_labels)
+
+    return blob_features
 
 
 def morph(source, target, steps, output_folder, **kwargs):
@@ -130,7 +180,7 @@ def morph(source, target, steps, output_folder, **kwargs):
     return png_image_paths, npy_image_paths
 
 
-def setup_morpher(source, target, output_folder, **kwargs):
+def setup_morpher(source, target, output_folder, padding_args=None, **kwargs):
     """
 
     Parameters
@@ -164,7 +214,7 @@ def setup_morpher(source, target, output_folder, **kwargs):
         target = make_image_rgb(target)
 
     # Pad them to the same square size
-    source, target = pad_images_to_same_square(source, target, color="black")
+    source, target = pad_images_to_same_square(source, target, color="black", **padding_args)
 
     src_name_padded = os.path.join(output_folder, "source_image_padded.png")
     trg_name_padded = os.path.join(output_folder, "target_image_padded.png")
@@ -241,6 +291,58 @@ def single_image_morpher(morph_class, morphed_dim, source_dim, target_dim, scale
     return crop_im
 
 
+def single_blob_morpher(morph_class, pct, crop_threshold=10, save_images=True, name=""):
+    """
+
+    Parameters
+    ----------
+    morph_class : morphing.Morph
+        A trained instance of the Morph class.
+    pct : float
+        Percentage of the transition between source and target, should be in the range [0, 1]
+    crop_threshold : int or float
+        Value between 0 and 255, threshold value for binarize image, when cropping out structure.
+    save_images : bool or string
+        Folder to save images to default folder from morph_class or a specific folder
+    name : str
+        Name to be used for the file along with dimensions
+
+    Returns
+    -------
+    np.ndarray
+        Morhped image
+    """
+    if pct > 1.0:
+        ValueError(f"Morph percentage should be a float between [0, 1]. Got {pct}")
+
+    height_pct = pct * 100
+    morphed_im = morph_class.generate_single_morphed(height_pct)
+
+    mean_im = np.mean(gaussian_filter(morphed_im, sigma=2), axis=2) >= crop_threshold
+    rows = np.argwhere(np.sum(mean_im, axis=1))
+    cols = np.argwhere(np.sum(mean_im, axis=0))
+    min_row, max_row = np.min(rows), np.max(rows) + 1
+    min_col, max_col = np.min(cols), np.max(cols) + 1
+
+    crop_im = morphed_im[min_row:max_row, min_col:max_col, ...]
+
+    if save_images:
+        if isinstance(save_images, str):
+            outdir = save_images
+        else:
+            outdir = os.path.join(morph_class.output_folder, "morhped_blob")
+        if not os.path.exists(outdir):
+            os.mkdir(outdir)
+
+        if not name:
+            name = "single_blob"
+        name += f"_{height_pct:.1f}pct.png"
+
+        save_image(os.path.join(outdir, name), crop_im, detect_range=False)
+
+    return crop_im
+
+
 def single_image_morpher_resize(morph_class, morphed_dim, source_dim, target_dim, scale, save_images=True, name=""):
     """
 
@@ -283,7 +385,7 @@ def single_image_morpher_resize(morph_class, morphed_dim, source_dim, target_dim
     crop_im = crop_image_to_size(morphed_im, (morphed_dim[0], morphed_dim[0]), scale)
     vpx = int(np.ceil(morphed_dim[0] / scale))
     hpx = int(np.ceil(morphed_dim[1] / scale))
-    re_im = cv2.cvtColor(cv2.resize(cv2.cvtColor(crop_im, cv2.COLOR_RGB2BGR), (hpx,vpx)), cv2.COLOR_BGR2RGB)
+    re_im = cv2.cvtColor(cv2.resize(cv2.cvtColor(crop_im, cv2.COLOR_RGB2BGR), (hpx, vpx)), cv2.COLOR_BGR2RGB)
 
     if save_images:
         if isinstance(save_images, str):
@@ -352,7 +454,7 @@ def crop_image_to_size(image, size, scale, pos="cc"):
     return crop
 
 
-def pad_image_to_square(image, size=None, color="black", pos="cc"):
+def pad_image_to_square(image, size=None, extra_pad=0, color="black", pos="cc"):
     """ Pad an image to make it a square
 
     Parameters
@@ -361,6 +463,8 @@ def pad_image_to_square(image, size=None, color="black", pos="cc"):
         Image to pad
     size : int (optional)
         Size to pad to.
+    extra_pad : int (optional)
+        Number of extra pixels to each side. Default 0.
     color : string or list
         Color to pad with either a string "black", "red". Default: "black"
     pos : str
@@ -377,6 +481,7 @@ def pad_image_to_square(image, size=None, color="black", pos="cc"):
     assert color.lower() in COLOR_LOOKUP, f"Color '{color}' not found."
     bg = COLOR_LOOKUP.get(color)
 
+    assert isinstance(extra_pad, int), f"extra_pad must be an int, not {type(extra_pad).__name__}"
     assert isinstance(pos, str), f"Expected argument 'pos' to be of type 'str', not {type(pos).__name__}"
     assert len(pos) == 2, f"Argument 'pos' must have length 2, not {len(pos)}"
     vpos = pos[0].lower()
@@ -389,6 +494,7 @@ def pad_image_to_square(image, size=None, color="black", pos="cc"):
 
     if size is None:
         size = max(image.shape[0:2])
+    size += 2 * extra_pad
     (vsize, hsize, csize) = image.shape
     if (size, size) < (vsize, hsize):
         msg = f"At least one dimension of the image {image.shape} is larger than the specified size of {size}."
